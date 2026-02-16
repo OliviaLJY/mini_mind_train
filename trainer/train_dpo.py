@@ -50,6 +50,15 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     loss = -F.logsigmoid(beta * logits)
     return loss.mean()
 
+def grad_norm(model, norm_type=2.0):
+    # 只计算，不修改梯度
+    parameters = [p for p in model.parameters() if p.grad is not None]
+    if len(parameters) == 0:
+        return 0.0
+    device = parameters[0].grad.device
+    norms = torch.stack([torch.norm(p.grad.detach(), norm_type).to(device) for p in parameters])
+    total = torch.norm(norms, norm_type)
+    return total.item()
 
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=0.1):
     start_time = time.time()
@@ -65,6 +74,29 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         y = torch.cat([y_chosen, y_rejected], dim=0)
         mask = torch.cat([mask_chosen, mask_rejected], dim=0)
 
+        # ===== DEBUG LOG (print once) =====
+        if step == start_step + 1 and is_main_process():
+            with torch.no_grad():
+                # mask统计
+                ms = mask.sum(dim=1)
+                Logger(f"[debug] mask: dtype={mask.dtype}, shape={tuple(mask.shape)}, "
+                       f"sum(min/mean/max)={ms.min().item():.1f}/{ms.float().mean().item():.1f}/{ms.max().item():.1f}, "
+                       f"unique={torch.unique(mask).detach().cpu().tolist()[:10]}")
+
+                # chosen vs rejected 是否真的不同
+                diff_ratio = (x_chosen != x_rejected).float().mean().item()
+                Logger(f"[debug] x_chosen!=x_rejected token diff ratio: {diff_ratio:.4f}")
+
+                # label 是否大量为 ignore（常见 -100）
+                y_unique = torch.unique(y).detach().cpu()
+                Logger(f"[debug] y unique (first 20): {y_unique.tolist()[:20]}")
+                ignore_count = (y == -100).sum().item()
+                Logger(f"[debug] y==-100 count: {ignore_count} / {y.numel()}")
+
+                # 一眼看出是否全 0 导致 0.6931
+                zero_mask_rows = (ms == 0).sum().item()
+                Logger(f"[debug] mask rows with sum==0: {zero_mask_rows} / {mask.size(0)}")
+
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
@@ -74,6 +106,12 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
                 ref_outputs = ref_model(x)
                 ref_logits = ref_outputs.logits
             ref_log_probs = logits_to_log_probs(ref_logits, y)
+
+            if step == start_step + 1 and is_main_process():
+                with torch.no_grad():
+                    ms = mask.sum(dim=1).clamp_min(1e-8)
+                    ref_score = (ref_log_probs * mask).sum(dim=1) / ms
+                    Logger(f"[debug] ref_score (first 8): {ref_score.detach().cpu().tolist()[:8]}")
             
             outputs = model(x)
             logits = outputs.logits
@@ -85,9 +123,13 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
 
         scaler.scale(loss).backward()
 
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
+            pre = grad_norm(model)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+            post = grad_norm(model)
+            if is_main_process():
+                Logger(f"[stat] grad_norm pre={pre:.4f} post={post:.4f}")
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
@@ -101,6 +143,27 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
             
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, dpo_loss: {current_dpo_loss:.4f}, aux_loss: {current_aux_loss:.4f}, learning_rate: {current_lr:.8f}, epoch_time: {eta_min:.3f}min')
+            
+            with torch.no_grad():
+                # 复用 dpo_loss 里同样的句子级score算法
+                ms = mask.sum(dim=1).clamp_min(1e-8)
+                ref_score = (ref_log_probs * mask).sum(dim=1) / ms
+                pol_score = (policy_log_probs * mask).sum(dim=1) / ms
+
+                bs = ref_score.size(0)
+                cr, rr = ref_score[:bs//2], ref_score[bs//2:]
+                cp, rp = pol_score[:bs//2], pol_score[bs//2:]
+
+                pi_lr = (cp - rp)
+                ref_lr = (cr - rr)
+                dpo_logits = (pi_lr - ref_lr)
+
+                pref_acc = (dpo_logits > 0).float().mean().item()
+
+            Logger(f"[stat] pi_lr mean={pi_lr.mean().item():.4f} std={pi_lr.std().item():.4f} | "
+                f"ref_lr mean={ref_lr.mean().item():.4f} std={ref_lr.std().item():.4f} | "
+                f"logits mean={dpo_logits.mean().item():.4f} std={dpo_logits.std().item():.4f} | "
+                f"pref_acc={pref_acc:.3f}")
             
             if wandb: wandb.log({"loss": current_loss, "dpo_loss": current_dpo_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
@@ -126,7 +189,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_weight', default='dpo', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
-    parser.add_argument("--learning_rate", type=float, default=4e-8, help="初始学习率（建议<=5e-8避免遗忘）")
+    parser.add_argument("--learning_rate", type=float, default=2e-6, help="初始学习率（建议<=5e-8避免遗忘）")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
     parser.add_argument("--num_workers", type=int, default=8, help="数据加载线程数")
