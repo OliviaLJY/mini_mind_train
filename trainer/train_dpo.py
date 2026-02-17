@@ -1,9 +1,17 @@
+# DPO 调参优先级：
+# ① β
+# ② effective batch size
+# ③ learning rate
+# ④ accumulation_steps
+# ⑤ KL weight（如果有）
+
 # some definitions for DPO
 # model  → policy model (being trained)
 # ref_model → reference model (frozen SFT model)
 # kl_proxy mean: how far the policy distribution has moved from the reference distribution
 # std: how much the policy-reference difference varies across samples
 # l2 (mean((policy_logp − ref_logp)^2)): magnitude of policy drift from reference.
+
 
 import os
 import sys
